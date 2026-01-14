@@ -12,6 +12,14 @@ from typing import List, Optional, Dict, Any
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI
+import os
+
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Response
 from pydantic import BaseModel, Field
