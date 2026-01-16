@@ -1,38 +1,47 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import os, json, time
 from typing import Any, Dict, List, Optional
 
-# Postgres optional
+# -----------------------------
+# CONFIG
+# -----------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-
-# SQLite fallback (dev/local)
 SQLITE_PATH = os.environ.get("DB_PATH", "stats.db")
-
 USE_POSTGRES = bool(DATABASE_URL)
 
-app = FastAPI(title="CCA Matcher Backend", version="3.0")
+app = FastAPI(title="CCA Matcher Backend", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict later
+    allow_origins=["*"],          # you can restrict later
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["*"],          # IMPORTANT: allows DELETE + OPTIONS preflight
     allow_headers=["*"],
 )
 
+# -----------------------------
+# HELPERS
+# -----------------------------
 def norm(x: Any) -> str:
     return (str(x).strip()) if x is not None else ""
 
 def safe_list(x: Any) -> List[Any]:
     return x if isinstance(x, list) else []
 
+def count_map_add(m: Dict[str, int], key: Optional[str], inc: int = 1) -> None:
+    k = key if key and str(key).strip() else "(blank)"
+    m[k] = m.get(k, 0) + inc
+
+def sort_dict(d: Dict[str, int]) -> Dict[str, int]:
+    return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0].lower())))
+
 # -----------------------------
 # DB LAYER (Postgres or SQLite)
 # -----------------------------
-def init_db():
+def init_db() -> None:
     if USE_POSTGRES:
         import psycopg
         with psycopg.connect(DATABASE_URL) as conn:
@@ -129,7 +138,8 @@ def fetch_all_events() -> List[Dict[str, Any]]:
                     ORDER BY ts DESC
                 """)
                 rows = cur.fetchall()
-        out = []
+
+        out: List[Dict[str, Any]] = []
         for r in rows:
             out.append({
                 "ts": r[0], "event_type": r[1],
@@ -152,12 +162,28 @@ def fetch_all_events() -> List[Dict[str, Any]]:
         conn.close()
         return [dict(r) for r in rows]
 
-def count_map_add(m: Dict[str, int], key: Optional[str], inc: int = 1) -> None:
-    k = key if key and str(key).strip() else "(blank)"
-    m[k] = m.get(k, 0) + inc
-
-def sort_dict(d: Dict[str, int]) -> Dict[str, int]:
-    return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0].lower())))
+def clear_all_events() -> int:
+    """
+    Deletes all events and returns how many rows were deleted (best-effort).
+    """
+    if USE_POSTGRES:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                # RETURNING gives us deleted count reliably on Postgres
+                cur.execute("DELETE FROM events RETURNING 1;")
+                deleted = cur.rowcount  # should be number of deleted rows
+            conn.commit()
+        return int(deleted or 0)
+    else:
+        import sqlite3
+        conn = sqlite3.connect(SQLITE_PATH)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM events;")
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        return int(deleted or 0)
 
 # -----------------------------
 # ROUTES
@@ -198,27 +224,16 @@ async def api_events(request: Request):
     }
 
     total = insert_event(row)
-    # returning total helps you verify instantly that inserts are happening
     return {"ok": True, "totalEventsNow": total, "storage": ("postgres" if USE_POSTGRES else "sqlite")}
 
-from fastapi import FastAPI, HTTPException
-from sqlalchemy import text
-
-# ... your existing app = FastAPI() and engine setup ...
-
 @app.delete("/api/stats")
-def clear_stats():
-    """
-    Deletes all stored stats/events from the database.
-    Assumes your events table is named 'events'.
-    """
+def api_clear_stats():
+    init_db()
     try:
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM events;"))
-        return {"status": "cleared"}
+        deleted = clear_all_events()
+        return {"ok": True, "status": "cleared", "deleted": deleted, "storage": ("postgres" if USE_POSTGRES else "sqlite")}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to clear stats: {e}")
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/stats")
 def api_stats():
@@ -238,11 +253,12 @@ def api_stats():
     shortlist_events = 0
 
     for r in rows:
-        et = r["event_type"]
+        et = r.get("event_type")
 
         if et == "generate":
             generate_events += 1
             count_map_add(categories, r.get("category_selected"))
+            # If not Activity, activity_type_selected may be null → treat as (n/a)
             count_map_add(activity_types, r.get("activity_type_selected") or "(n/a)")
             count_map_add(grades, r.get("grade"))
             count_map_add(genders, r.get("gender") or "Any")
