@@ -1,247 +1,169 @@
-# app.py (Postgres / shared tracking version)
-# Works on Render (or any host) using DATABASE_URL env var.
-# Run locally: set DATABASE_URL, then: uvicorn app:app --reload --port 8000
-
-from __future__ import annotations
-
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+import sqlite3
 import json
 import os
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
+import time
+from typing import Any, Dict, List, Optional
 
-import psycopg
-from psycopg.rows import dict_row
-from fastapi import FastAPI
-import os
+DB_PATH = os.environ.get("DB_PATH", "stats.db")
 
 app = FastAPI()
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Response
-from pydantic import BaseModel, Field
-
-# -----------------------------
-# Config
-# -----------------------------
-DATABASE_URL = os.environ.get("DATABASE_URL")  # REQUIRED on Render
-
-# CORS: allow your frontend(s). For quick deployment, allow all origins.
-# If you want stricter: set FRONTEND_ORIGINS="https://yoursite.com,https://www.yoursite.com"
-FRONTEND_ORIGINS = os.environ.get("FRONTEND_ORIGINS", "*")
-ALLOWED_ORIGINS = (
-    ["*"]
-    if FRONTEND_ORIGINS.strip() == "*"
-    else [o.strip() for o in FRONTEND_ORIGINS.split(",") if o.strip()]
-)
-
-app = FastAPI(title="CCA Matcher Backend (Postgres)", version="2.0.0")
-
+# CORS: allows GitHub Pages (HTTPS) to call Render
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],  # You can later restrict to your GitHub Pages domain
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            category_selected TEXT,
+            activity_type_selected TEXT,
+            grade TEXT,
+            gender TEXT,
+            interests_json TEXT,
+            shown_ccas_json TEXT,
+            shortlisted_cca TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-def get_conn():
-    """
-    Open a new Postgres connection (safe for concurrency).
-    Render provides DATABASE_URL. If it's missing, the app can't run globally.
-    """
-    if not DATABASE_URL:
-        # This makes the error obvious in logs if you forgot to set env var.
-        raise RuntimeError("DATABASE_URL is not set. Add it in your host environment (Render).")
-    # dict_row makes SELECT results come back like dicts
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+def norm(s: Any) -> str:
+    return (str(s).strip()) if s is not None else ""
 
+def safe_list(x: Any) -> List[Any]:
+    return x if isinstance(x, list) else []
 
-def init_db() -> None:
-    """Create tables if they don't exist."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS generate_events (
-                    id BIGSERIAL PRIMARY KEY,
-                    ts TEXT NOT NULL,
-                    student_id TEXT NOT NULL,
-                    category TEXT,
-                    time TEXT,
-                    venue TEXT,
-                    typepref TEXT,
-                    interests TEXT,
-                    results_json TEXT
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS click_events (
-                    id BIGSERIAL PRIMARY KEY,
-                    ts TEXT NOT NULL,
-                    student_id TEXT NOT NULL,
-                    cca_name TEXT NOT NULL
-                )
-                """
-            )
-        conn.commit()
+def count_map_add(m: Dict[str, int], key: Optional[str], inc: int = 1):
+    k = key if key and str(key).strip() else "(blank)"
+    m[k] = m.get(k, 0) + inc
 
+def sort_dict(d: Dict[str, int]) -> Dict[str, int]:
+    return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0].lower())))
 
-@app.on_event("startup")
-def on_startup():
+@app.get("/")
+def home():
+    return PlainTextResponse("OK")
+
+@app.post("/api/events")
+async def api_events(request: Request):
     init_db()
+    data = await request.json()
 
+    # expected from cca.html:
+    # eventType: "generate" or "shortlist"
+    event_type = norm(data.get("eventType"))
+    if event_type not in ("generate", "shortlist"):
+        return JSONResponse({"ok": False, "error": "Invalid eventType"}, status_code=400)
 
-# -----------------------------
-# Models
-# -----------------------------
-class ClickEvent(BaseModel):
-    student_id: str = Field(..., min_length=1, max_length=200)
-    cca_name: str = Field(..., min_length=1, max_length=300)
+    ts = int(time.time() * 1000)
 
+    category_selected = norm(data.get("categorySelected")) or None
+    activity_type_selected = data.get("activityTypeSelected")
+    activity_type_selected = None if activity_type_selected is None else norm(activity_type_selected)
 
-class GenerateResult(BaseModel):
-    name: str
-    desc: Optional[str] = None
-    cat: Optional[str] = None
-    venue: Optional[str] = None
-    time: Optional[str] = None
-    type: Optional[str] = None
+    grade = data.get("grade")
+    grade = None if grade is None else norm(grade)  # e.g. "Grade 7"
 
+    gender = norm(data.get("gender")) or None
 
-class GenerateEvent(BaseModel):
-    student_id: str = Field(..., min_length=1, max_length=200)
-    category: Optional[str] = None
-    time: Optional[str] = None
-    venue: Optional[str] = None
-    typepref: Optional[str] = None
-    interests: Optional[str] = None
-    results: List[GenerateResult] = []
+    interests = safe_list(data.get("interests"))
+    shown_ccas = safe_list(data.get("shownCCAs"))
+    shortlisted_cca = norm(data.get("shortlistedCCA")) or None
 
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO events (
+            ts, event_type, category_selected, activity_type_selected,
+            grade, gender, interests_json, shown_ccas_json, shortlisted_cca
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        ts,
+        event_type,
+        category_selected,
+        activity_type_selected,
+        grade,
+        gender,
+        json.dumps(interests, ensure_ascii=False),
+        json.dumps(shown_ccas, ensure_ascii=False),
+        shortlisted_cca
+    ))
+    conn.commit()
+    conn.close()
 
-# -----------------------------
-# Routes
-# -----------------------------
-@app.get("/health")
-def health():
     return {"ok": True}
 
-
-@app.post("/track/click")
-def track_click(payload: ClickEvent):
+@app.get("/api/stats")
+def api_stats():
     init_db()
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO click_events (ts, student_id, cca_name)
-                VALUES (%s, %s, %s)
-                """
-                ,
-                (now_iso(), payload.student_id, payload.cca_name),
-            )
-        conn.commit()
-    return {"ok": True}
+    conn = db()
+    rows = conn.execute("SELECT * FROM events ORDER BY ts DESC").fetchall()
+    conn.close()
 
+    total_events = len(rows)
 
-@app.post("/track/generate")
-def track_generate(payload: GenerateEvent):
-    init_db()
-    results_json = json.dumps([r.model_dump() for r in payload.results], ensure_ascii=False)
+    categories: Dict[str, int] = {}
+    activity_types: Dict[str, int] = {}
+    grades: Dict[str, int] = {}
+    genders: Dict[str, int] = {}
+    interests: Dict[str, int] = {}
+    shortlisted: Dict[str, int] = {}
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO generate_events (ts, student_id, category, time, venue, typepref, interests, results_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    now_iso(),
-                    payload.student_id,
-                    payload.category,
-                    payload.time,
-                    payload.venue,
-                    payload.typepref,
-                    payload.interests,
-                    results_json,
-                ),
-            )
-        conn.commit()
-    return {"ok": True}
+    generate_events = 0
+    shortlist_events = 0
 
+    for r in rows:
+        et = r["event_type"]
 
-@app.get("/stats/summary")
-def stats_summary():
-    """
-    Returns:
-    - totals: generates + clicks
-    - top_clicked_ccas: top 10 clicked
-    - distributions: category/time/venue/typepref based on generate_events
-    """
-    init_db()
+        if et == "generate":
+            generate_events += 1
+            count_map_add(categories, r["category_selected"])
+            count_map_add(activity_types, r["activity_type_selected"] or "(n/a)")
+            count_map_add(grades, r["grade"])
+            count_map_add(genders, r["gender"] or "Any")
 
-    def top_dist(col: str) -> List[Dict[str, Any]]:
-        # Quote column safely (Postgres uses double-quotes for identifiers)
-        qcol = f'"{col}"'
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT {qcol} AS value, COUNT(*) AS c
-                    FROM generate_events
-                    GROUP BY {qcol}
-                    ORDER BY c DESC
-                    LIMIT 10
-                    """
-                )
-                rows = cur.fetchall()
-        return [{"value": r["value"], "count": r["c"]} for r in rows]
+            try:
+                ints = json.loads(r["interests_json"] or "[]")
+            except:
+                ints = []
+            for t in ints:
+                tok = norm(t).lower()
+                if tok:
+                    count_map_add(interests, tok)
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS n FROM generate_events")
-            total_generates = cur.fetchone()["n"]
-
-            cur.execute("SELECT COUNT(*) AS n FROM click_events")
-            total_clicks = cur.fetchone()["n"]
-
-            cur.execute(
-                """
-                SELECT cca_name, COUNT(*) AS c
-                FROM click_events
-                GROUP BY cca_name
-                ORDER BY c DESC
-                LIMIT 10
-                """
-            )
-            top_ccas = cur.fetchall()
+        elif et == "shortlist":
+            shortlist_events += 1
+            name = r["shortlisted_cca"]
+            if name:
+                count_map_add(shortlisted, name)
 
     return {
-        "totals": {"generates": total_generates, "clicks": total_clicks},
-        "top_clicked_ccas": [{"cca": r["cca_name"], "count": r["c"]} for r in top_ccas],
-        "distributions": {
-            "category": top_dist("category"),
-            "time": top_dist("time"),
-            "venue": top_dist("venue"),
-            "typepref": top_dist("typepref"),
-        },
+        "totalEvents": total_events,
+        "generateEvents": generate_events,
+        "shortlistEvents": shortlist_events,
+        "categories": sort_dict(categories),
+        "activityTypes": sort_dict(activity_types),
+        "grades": sort_dict(grades),
+        "genders": sort_dict(genders),
+        "interests": sort_dict(interests),
+        "shortlisted": sort_dict(shortlisted),
     }
-
-
-# Optional: silence favicon 404s
-@app.get("/favicon.ico")
-def favicon():
-    return Response(status_code=204)
