@@ -62,16 +62,77 @@ def sort_dict(d: Dict[str, int]) -> Dict[str, int]:
 def home():
     return PlainTextResponse("OK")
 
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import sqlite3, json, os, time
+from typing import Any, Dict, List, Optional
+
+DB_PATH = os.environ.get("DB_PATH", "stats.db")
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            category_selected TEXT,
+            activity_type_selected TEXT,
+            grade TEXT,
+            gender TEXT,
+            interests_json TEXT,
+            shown_ccas_json TEXT,
+            shortlisted_cca TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def norm(x: Any) -> str:
+    return (str(x).strip()) if x is not None else ""
+
+def safe_list(x: Any) -> List[Any]:
+    return x if isinstance(x, list) else []
+
+@app.get("/")
+def home():
+    return {"ok": True}
+
 @app.post("/api/events")
 async def api_events(request: Request):
     init_db()
-    data = await request.json()
 
-    # expected from cca.html:
-    # eventType: "generate" or "shortlist"
+    # ✅ SAFE JSON PARSE (no more 500 on empty body)
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+
     event_type = norm(data.get("eventType"))
     if event_type not in ("generate", "shortlist"):
-        return JSONResponse({"ok": False, "error": "Invalid eventType"}, status_code=400)
+        return JSONResponse(
+            {"ok": False, "error": "Invalid or missing eventType (use 'generate' or 'shortlist')"},
+            status_code=400
+        )
 
     ts = int(time.time() * 1000)
 
@@ -80,13 +141,13 @@ async def api_events(request: Request):
     activity_type_selected = None if activity_type_selected is None else norm(activity_type_selected)
 
     grade = data.get("grade")
-    grade = None if grade is None else norm(grade)  # e.g. "Grade 7"
+    grade = None if grade is None else norm(grade)
 
     gender = norm(data.get("gender")) or None
 
     interests = safe_list(data.get("interests"))
     shown_ccas = safe_list(data.get("shownCCAs"))
-    shortlisted_cca = norm(data.get("shortlistedCCA")) or None
+    shortlisted = norm(data.get("shortlistedCCA")) or None
 
     conn = db()
     cur = conn.cursor()
@@ -105,12 +166,13 @@ async def api_events(request: Request):
         gender,
         json.dumps(interests, ensure_ascii=False),
         json.dumps(shown_ccas, ensure_ascii=False),
-        shortlisted_cca
+        shortlisted
     ))
     conn.commit()
     conn.close()
 
     return {"ok": True}
+
 
 @app.get("/api/stats")
 def api_stats():
